@@ -8,13 +8,11 @@
 
 plugins {
     id 'java-library'
+    id 'maven-publish'
 }
 
 description = 'Token-Aware Adaptive Admission Control — Spring Boot Starter'
 
-// String literal — avoids reaching into the SpringBootPlugin class which
-// requires the plugin to be on the subproject's buildscript classpath
-// (not always the case with `apply false` in the root project).
 dependencyManagement {
     imports {
         mavenBom "org.springframework.boot:spring-boot-dependencies:3.5.10"
@@ -22,21 +20,62 @@ dependencyManagement {
 }
 
 dependencies {
-    // Spring Boot core — autoconfigure + ConfigurationProperties + scheduling.
-    // `api` because we expose Spring types in our public API (e.g. AdmissionListener
-    // sits next to Spring annotations user code may need).
+    // `api` because we expose Spring types in our own SPI (annotations users
+    // see on the bean methods, etc.).
     api 'org.springframework.boot:spring-boot-starter'
 
-    // ConfigurationProperties annotation processor — generates metadata.json
-    // so IDEs surface `taac.*` properties with autocomplete and Javadoc.
+    // Generates META-INF/spring-configuration-metadata.json so IDEs offer
+    // autocomplete + Javadoc for the `taac.*` properties.
     annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
 
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
-// We don't ship a runnable jar from a starter — only a regular library jar.
 jar {
     enabled = true
     archiveClassifier = ''
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Publishing
+//
+// Local: `./gradlew :taac-spring-boot-starter:publishToMavenLocal`
+//        Consumers add `repositories { mavenLocal() }`.
+//
+// Central: needs signing + Sonatype credentials; not configured here.
+// ──────────────────────────────────────────────────────────────────────────
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+
+            pom {
+                name = 'TAAC Spring Boot Starter'
+                description = project.description
+                url = 'https://github.com/chanseok2323/taac-spring-boot-starter'
+
+                licenses {
+                    license {
+                        name = 'The Apache License, Version 2.0'
+                        url  = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+
+                developers {
+                    developer {
+                        id    = 'chanseok2323'
+                        name  = 'Chanseok Park'
+                        email = 'chanseok2323@gmail.com'
+                    }
+                }
+
+                scm {
+                    connection          = 'scm:git:https://github.com/chanseok2323/taac-spring-boot-starter.git'
+                    developerConnection = 'scm:git:ssh://git@github.com/chanseok2323/taac-spring-boot-starter.git'
+                    url                 = 'https://github.com/chanseok2323/taac-spring-boot-starter'
+                }
+            }
+        }
+    }
 }
