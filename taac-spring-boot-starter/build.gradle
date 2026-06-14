@@ -1,0 +1,42 @@
+// ──────────────────────────────────────────────────────────────────────────
+// TAAC Spring Boot Starter
+//
+// Token-Aware Adaptive Admission Control as a Spring Boot starter.
+// Drop the dependency in, set `taac.admission.policy=vegas`, and the gate
+// is wired into the context automatically.
+// ──────────────────────────────────────────────────────────────────────────
+
+plugins {
+    id 'java-library'
+}
+
+description = 'Token-Aware Adaptive Admission Control — Spring Boot Starter'
+
+// String literal — avoids reaching into the SpringBootPlugin class which
+// requires the plugin to be on the subproject's buildscript classpath
+// (not always the case with `apply false` in the root project).
+dependencyManagement {
+    imports {
+        mavenBom "org.springframework.boot:spring-boot-dependencies:3.5.10"
+    }
+}
+
+dependencies {
+    // Spring Boot core — autoconfigure + ConfigurationProperties + scheduling.
+    // `api` because we expose Spring types in our public API (e.g. AdmissionListener
+    // sits next to Spring annotations user code may need).
+    api 'org.springframework.boot:spring-boot-starter'
+
+    // ConfigurationProperties annotation processor — generates metadata.json
+    // so IDEs surface `taac.*` properties with autocomplete and Javadoc.
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// We don't ship a runnable jar from a starter — only a regular library jar.
+jar {
+    enabled = true
+    archiveClassifier = ''
+}

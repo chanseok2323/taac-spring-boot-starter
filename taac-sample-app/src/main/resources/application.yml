@@ -1,0 +1,48 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: taac-sample-app
+  threads:
+    virtual:
+      enabled: true
+
+# ──────────────────────────────────────────────────────────────────────────
+# TAAC — Token-Aware Adaptive Admission Control
+#
+# starter는 아래 설정만 보고 알맞은 정책/컨트롤러를 자동 등록한다.
+# ──────────────────────────────────────────────────────────────────────────
+taac:
+  enabled: true
+  admission:
+    # 정책 선택:
+    #   vegas         — 토큰 인지 적응형 Vegas (제안 기법, 기본값)
+    #   vegas-pure    — TCP Vegas 단순 이식 (literature 비교군)
+    #   response-time — 응답 시간 기반 적응형
+    #   standard-aimd — TCP 표준 AIMD
+    #   fixed         — 고정 permit
+    #   baseline      — 진입 제어 없음 (비교용)
+    policy: vegas
+    max-concurrency: 30
+    min-concurrency: 5
+    timeout-ms: 30000
+    eval-interval-ms: 50
+    fair: false
+    dynamic-capacity-fail-fast: true
+    underflow-mode: log-only
+    scheduler-idle-park-ms: 50
+    fast-path-enabled: true
+    threshold:
+      moderate: 0.70
+      high:     0.85
+      critical: 0.92
+  token:
+    default-avg: 500
+    max-weight: 3
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
