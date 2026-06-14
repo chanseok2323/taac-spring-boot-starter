@@ -9,142 +9,61 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Pure Vegas 정책 — Literature 기준 비교군.
+ * Baseline TCP Vegas (Brakmo &amp; Peterson, 1995) ported to admission
+ * control with no domain adaptations — used to isolate the contribution
+ * of the token-aware extensions in {@link TokenAwareVegasPolicy}.
  *
- * ── 학술적 위치 ──
- *
- * TCP Vegas (Brakmo &amp; Peterson, 1995) 의 delay-based congestion control 을
- * LLM admission 도메인에 단순 이식한 baseline. 본 논문의 제안 시스템과의
- * head-to-head 비교 대상으로 사용된다.
- *
- * ── 본 논문 제안 시스템({@link TokenAwareVegasPolicy}) 과의 차이 ──
- *
- * 1. **신호**: 토큰 정규화 없음.
- *    Pure Vegas signal = totalTime / sampleCount    (raw 평균 RTT)
- *    Our system signal = totalTime / totalTokens    (token-normalized)
- *
- * 2. **Heap-aware 강등 없음**: Vegas 는 delay-only 정책이므로 memory 신호 통합 없음.
- *
- * ── Vegas 3단 제어는 동일 ──
- *
- * AI / HOLD / MD 의 3단 분기 자체는 TCP Vegas 원형이므로 본 정책에서도 유지한다.
- * Pure Vegas vs Our Vegas 비교는 "동일 알고리즘 골격 + 우리가 추가한 LLM 도메인 적응" 의
- * 효과를 측정하는 구조.
+ * <p>Signal is the raw average response time; heap is reported but doesn't
+ * influence the target.
  */
 public class PureVegasPolicy implements ConcurrencyPolicy {
 
     private static final Logger log = LoggerFactory.getLogger(PureVegasPolicy.class);
 
+    private static final double BETA  = 1.10;
+    private static final double ALPHA = 0.95;
+    private static final double MD_FACTOR = 0.70;
+    private static final double HOLD_EMA  = 0.20;
+    private static final int    EVAL_INTERVAL  = 5;
+    private static final int    WARMUP_SAMPLES = 3;
+    private static final double WARMUP_BUFFER  = 2.0;
+
     private final int maxConcurrency;
     private final int minConcurrency;
+    private final double moderateHeap;
+    private final double highHeap;
+    private final double criticalHeap;
 
-    private static final double VEGAS_BETA = 1.1;
-    private static final double VEGAS_ALPHA = 0.95;
-    private static final double MULTIPLICATIVE_DECREASE = 0.7;
-    private static final double ALPHA_HOLD = 0.2;
-
-    private static final int EVAL_INTERVAL = 5;
-    private static final int WARMUP_INTERVALS = 3;
-    private static final double WARMUP_BUFFER = 2.0;
-
-    private final AtomicLong completionCount = new AtomicLong(0);
+    private final AtomicLong responseTimeSum = new AtomicLong();
+    private final AtomicLong completionCount = new AtomicLong();
     private volatile long lastEvalCount;
 
-    private volatile int warmupSeen = 0;
-    private volatile double warmupSum = 0;
-
-    private final AtomicLong responseTimeSum = new AtomicLong(0);
-    private volatile double lastSignal;
+    private volatile int    warmupSeen;
+    private volatile double warmupSum;
+    private volatile double baseline;
 
     private final AtomicInteger currentTarget;
     private final ReentrantLock adjustLock = new ReentrantLock();
 
-    public PureVegasPolicy(int maxConcurrency, int minConcurrency) {
+    public PureVegasPolicy(int maxConcurrency,
+                           int minConcurrency,
+                           double moderateHeap,
+                           double highHeap,
+                           double criticalHeap) {
         this.maxConcurrency = maxConcurrency;
         this.minConcurrency = minConcurrency;
-        this.currentTarget = new AtomicInteger(maxConcurrency);
-        this.lastEvalCount = 0;
-        this.lastSignal = 0;
-    }
-
-    public void recordCompletion(long responseTimeMs) {
-        responseTimeSum.addAndGet(responseTimeMs);
-        long count = completionCount.incrementAndGet();
-        if (count - lastEvalCount >= EVAL_INTERVAL) {
-            adjustTarget();
-        }
+        this.moderateHeap   = moderateHeap;
+        this.highHeap       = highHeap;
+        this.criticalHeap   = criticalHeap;
+        this.currentTarget  = new AtomicInteger(maxConcurrency);
     }
 
     @Override
     public void recordCompletion(long responseTimeMs, int inputTokens, int outputTokens) {
-        recordCompletion(responseTimeMs);
-    }
-
-    private void adjustTarget() {
-        if (!adjustLock.tryLock()) return;
-        try {
-            long totalTime = responseTimeSum.getAndSet(0);
-            long sampledCount = completionCount.get();
-            long sinceLast = sampledCount - lastEvalCount;
-            if (sinceLast < EVAL_INTERVAL) {
-                responseTimeSum.addAndGet(totalTime);
-                return;
-            }
-
-            double signal = sinceLast > 0 ? (double) totalTime / sinceLast : 0;
-
-            if (warmupSeen < WARMUP_INTERVALS) {
-                warmupSum += signal;
-                warmupSeen++;
-                if (warmupSeen == WARMUP_INTERVALS) {
-                    lastSignal = (warmupSum / WARMUP_INTERVALS) * WARMUP_BUFFER;
-                    if (log.isInfoEnabled()) {
-                        log.info("vegas_pure_warmup_done baseline={} samples_avg={}",
-                                String.format("%.3f", lastSignal),
-                                String.format("%.3f", warmupSum / WARMUP_INTERVALS));
-                    }
-                }
-                lastEvalCount = sampledCount;
-                return;
-            }
-
-            int prevTarget = currentTarget.get();
-            int target = prevTarget;
-            String reason = "hold";
-
-            if (lastSignal > 0) {
-                if (signal > lastSignal * VEGAS_BETA) {
-                    target = Math.max(minConcurrency, (int) (target * MULTIPLICATIVE_DECREASE));
-                    reason = "vegas_decrease_congested";
-                } else if (signal < lastSignal * VEGAS_ALPHA) {
-                    target = Math.min(maxConcurrency, target + 2);
-                    reason = "vegas_increase_underutilized";
-                } else {
-                    reason = "vegas_hold_stable";
-                }
-            }
-
-            double prevBaseline = lastSignal;
-            if ("vegas_decrease_congested".equals(reason)) {
-                lastSignal = (lastSignal + signal) / 2.0;
-            } else if ("vegas_hold_stable".equals(reason)) {
-                lastSignal = (1 - ALPHA_HOLD) * lastSignal + ALPHA_HOLD * signal;
-            } else {
-                lastSignal = signal;
-            }
-
-            currentTarget.set(target);
-            lastEvalCount = sampledCount;
-
-            if (target != prevTarget && log.isInfoEnabled()) {
-                log.info("vegas_pure_adjust reason={} target={}->{} signal={} prev_baseline={} new_baseline={}",
-                        reason, prevTarget, target,
-                        String.format("%.3f", signal),
-                        String.format("%.3f", prevBaseline),
-                        String.format("%.3f", lastSignal));
-            }
-        } finally {
-            adjustLock.unlock();
+        responseTimeSum.addAndGet(responseTimeMs);
+        long count = completionCount.incrementAndGet();
+        if (count - lastEvalCount >= EVAL_INTERVAL) {
+            adjustTarget();
         }
     }
 
@@ -155,14 +74,69 @@ public class PureVegasPolicy implements ConcurrencyPolicy {
 
     @Override
     public MemoryPressureLevel pressureLevel(MemorySnapshot snapshot) {
-        double heapUsage = snapshot.usageRatio();
-        if (heapUsage >= 0.92) return MemoryPressureLevel.CRITICAL;
-        if (heapUsage >= 0.85) return MemoryPressureLevel.HIGH;
-        if (heapUsage >= 0.70) return MemoryPressureLevel.MODERATE;
-        return MemoryPressureLevel.LOW;
+        return HeapPressureClassifier.classify(snapshot.usageRatio(), moderateHeap, highHeap, criticalHeap);
     }
 
-    public int currentTarget() {
-        return currentTarget.get();
+    public int currentTarget() { return currentTarget.get(); }
+
+    // --- internals ----------------------------------------------------------
+
+    private enum Reason { DECREASE, HOLD, INCREASE }
+
+    private void adjustTarget() {
+        if (!adjustLock.tryLock()) return;
+        try {
+            long totalTime = responseTimeSum.getAndSet(0);
+            long sampled   = completionCount.get();
+            long sinceLast = sampled - lastEvalCount;
+            if (sinceLast < EVAL_INTERVAL) {
+                responseTimeSum.addAndGet(totalTime);
+                return;
+            }
+            lastEvalCount = sampled;
+
+            double signal = sinceLast > 0 ? (double) totalTime / sinceLast : 0;
+
+            if (warmupSeen < WARMUP_SAMPLES) {
+                warmupSum += signal;
+                if (++warmupSeen == WARMUP_SAMPLES) {
+                    baseline = (warmupSum / WARMUP_SAMPLES) * WARMUP_BUFFER;
+                    log.info("warmup done — baseline={} (sample_avg={})",
+                            fmt(baseline), fmt(warmupSum / WARMUP_SAMPLES));
+                }
+                return;
+            }
+
+            int prev = currentTarget.get();
+            int next = prev;
+            Reason reason = Reason.HOLD;
+            if (baseline > 0) {
+                if (signal > baseline * BETA) {
+                    next = Math.max(minConcurrency, (int) (prev * MD_FACTOR));
+                    reason = Reason.DECREASE;
+                } else if (signal < baseline * ALPHA) {
+                    next = Math.min(maxConcurrency, prev + 2);
+                    reason = Reason.INCREASE;
+                }
+            }
+
+            double prevBaseline = baseline;
+            baseline = switch (reason) {
+                case DECREASE -> (baseline + signal) / 2.0;
+                case HOLD     -> (1 - HOLD_EMA) * baseline + HOLD_EMA * signal;
+                case INCREASE -> signal;
+            };
+            currentTarget.set(next);
+
+            if (next != prev) {
+                log.info("pure-vegas {} {} → {} (signal={}, baseline {} → {})",
+                        reason.name().toLowerCase(), prev, next,
+                        fmt(signal), fmt(prevBaseline), fmt(baseline));
+            }
+        } finally {
+            adjustLock.unlock();
+        }
     }
+
+    private static String fmt(double v) { return String.format("%.3f", v); }
 }

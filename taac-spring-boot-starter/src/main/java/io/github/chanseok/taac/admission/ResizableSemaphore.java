@@ -4,17 +4,13 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 동적으로 capacity가 변하는 Semaphore.
+ * Semaphore whose capacity can be grown and shrunk at runtime.
  *
- * Java 표준 {@link Semaphore#reducePermits(int)}(protected)을 노출하고,
- * capacity 증가용 {@link #addPermits(int)} 와 진단용 메서드를 추가하여
- * 락/CAS 기반 외부 debt counter 없이 O(1) 동시성 조정을 가능하게 한다.
- *
- * ── 핵심 동작 ──
- *
- * Semaphore 내부 state는 음수가 될 수 있다. shrink 직후 in-flight 수가
- * 새 capacity보다 크면 available은 음수가 되며, 후속 release()가 한 단계씩
- * 양수까지 끌어올려 자연스럽게 debt가 흡수된다 (Java 표준 동작).
+ * <p>{@link Semaphore#reducePermits(int)} is protected on the standard class,
+ * so we expose it and add {@link #addPermits(int)} for the opposite direction.
+ * Shrinking can temporarily push {@code availablePermits()} below zero — that
+ * "debt" is paid down by subsequent {@code release} calls, exactly the way
+ * the standard JDK class is documented to behave.
  */
 public class ResizableSemaphore extends Semaphore {
 
@@ -34,10 +30,10 @@ public class ResizableSemaphore extends Semaphore {
             throw new IllegalArgumentException("reduction < 0: " + reduction);
         }
         if (reduction == 0) return;
-        int currentLogical = logicalCapacity.get();
-        if (reduction > currentLogical) {
+        int current = logicalCapacity.get();
+        if (reduction > current) {
             throw new IllegalArgumentException(
-                    "reduction " + reduction + " > logicalCapacity " + currentLogical);
+                    "reduction " + reduction + " > logicalCapacity " + current);
         }
         super.reducePermits(reduction);
         logicalCapacity.addAndGet(-reduction);
@@ -52,10 +48,12 @@ public class ResizableSemaphore extends Semaphore {
         logicalCapacity.addAndGet(addition);
     }
 
+    /** Target capacity tracked separately from the (possibly negative) available count. */
     public int logicalCapacity() {
         return logicalCapacity.get();
     }
 
+    /** Magnitude of negative {@code availablePermits} — in-flight calls beyond capacity. */
     public int borrowedPermits() {
         int avail = availablePermits();
         return avail < 0 ? -avail : 0;

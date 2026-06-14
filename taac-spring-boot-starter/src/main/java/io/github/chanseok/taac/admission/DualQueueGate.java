@@ -12,51 +12,41 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * Single-FIFO weighted-permit admission gate (lock-free hot path, dedicated scheduler).
+ * Weighted-permit admission gate with a single FIFO queue and a dedicated
+ * scheduler thread.
  *
- * ── 설계 ──
- *
- * Producer-consumer 구조:
- *   - acquire/release 스레드 (producer): lock-free CAS + ConcurrentLinkedQueue에 offer, 그 후 park
- *   - 전용 scheduler thread (consumer): incoming → active deque drain, 스케줄링 결정,
- *     CAS로 grant, unpark로 waiter 깨움
- *
- * ── 학문적 근거 ──
- *
- * Producer-consumer / SEDA (Staged Event-Driven Architecture, Welsh 2001) 계보.
- * 요청 스레드와 스케줄링 스레드를 분리해 hot path 경합 제거.
- *
- * Single queue + bounded SJF (Shortest-Job-First) scan + aging reserve:
- * 큐 앞쪽 N 개 waiter 중 capacity 에 맞는 것 중 **가장 작은 weight 우선** admit.
- * 평균 대기시간 단축 (SRPT, Schrage 1968 의 LLM token-aware 적응).
- *
- * Aging reserve 로 head starvation 방지 — head 가 AGING_MS 이상 대기 시
- * 무조건 head 우선 처리 (capacity 맞으면 admit, 아니면 reserve).
+ * <p>Producer–consumer (SEDA, Welsh 2001): {@code acquire} / {@code release}
+ * stay lock-free on the hot path; the scheduler thread owns the queue and
+ * the grant decisions. Within a bounded scan window it picks the smallest
+ * fitting weight (SRPT-ish, Schrage 1968 adapted for token weights), with an
+ * aging reserve so the head of the queue can't be starved indefinitely.
  */
 public class DualQueueGate {
 
     private static final Logger log = LoggerFactory.getLogger(DualQueueGate.class);
 
+    /** How far into the queue the scheduler looks for a smaller weight that fits. */
     private static final int BACKFILL_SCAN = 8;
     private static final int SWEEP_INTERVAL = 32;
-    private static final int SWEEP_BUDGET = 4;
+    private static final int SWEEP_BUDGET   = 4;
+    /** Head waits this long before scheduling stops backfilling past it. */
     private static final long HEAD_AGING_MS = 500;
 
+    // --- shared, lock-free state ---------------------------------------------
     private final AtomicInteger logicalCapacity;
-    private final AtomicInteger inUseWeight = new AtomicInteger(0);
-    private final AtomicInteger activeCount = new AtomicInteger(0);
-
+    private final AtomicInteger inUseWeight = new AtomicInteger();
+    private final AtomicInteger activeCount = new AtomicInteger();
     private final ConcurrentLinkedQueue<Waiter> incoming = new ConcurrentLinkedQueue<>();
 
+    // --- scheduler-thread-only state -----------------------------------------
     private final Deque<Waiter> active = new ArrayDeque<>();
-    private int grantCounterSinceSweep = 0;
+    private int grantsSinceSweep;
 
     private final Thread schedulerThread;
     private volatile boolean running = true;
 
     public enum UnderflowMode { LOG_ONLY, STRICT }
     private final UnderflowMode underflowMode;
-
     private final long schedulerIdleParkNs;
     private final boolean fastPathEnabled;
 
@@ -75,28 +65,30 @@ public class DualQueueGate {
         if (initialCapacity < 0) {
             throw new IllegalArgumentException("initialCapacity < 0: " + initialCapacity);
         }
-        this.logicalCapacity = new AtomicInteger(initialCapacity);
-        this.underflowMode = underflowMode;
+        this.logicalCapacity     = new AtomicInteger(initialCapacity);
+        this.underflowMode       = underflowMode;
         this.schedulerIdleParkNs = schedulerIdleParkNs;
-        this.fastPathEnabled = fastPathEnabled;
-        this.schedulerThread = new Thread(this::schedulerLoop, "taac-DualQueueScheduler");
+        this.fastPathEnabled     = fastPathEnabled;
+        this.schedulerThread     = new Thread(this::schedulerLoop, "taac-DualQueueScheduler");
         this.schedulerThread.setDaemon(true);
         this.schedulerThread.start();
     }
 
-    private static class Waiter {
+    private static final class Waiter {
         final int weight;
-        final long enqueueTimeNanos;
+        final long enqueuedAtNs;
         final Thread thread;
-        volatile boolean granted = false;
-        volatile boolean cancelled = false;
+        volatile boolean granted;
+        volatile boolean cancelled;
 
         Waiter(int weight, Thread thread) {
             this.weight = weight;
-            this.enqueueTimeNanos = System.nanoTime();
+            this.enqueuedAtNs = System.nanoTime();
             this.thread = thread;
         }
     }
+
+    // --- producer API ---------------------------------------------------------
 
     public boolean acquire(int weight, long timeoutMs) throws InterruptedException {
         if (weight < 1) weight = 1;
@@ -104,8 +96,7 @@ public class DualQueueGate {
         if (fastPathEnabled && isEmpty()) {
             for (int spin = 0; spin < 3; spin++) {
                 int cur = inUseWeight.get();
-                int cap = logicalCapacity.get();
-                if (cur + weight > cap) break;
+                if (cur + weight > logicalCapacity.get()) break;
                 if (inUseWeight.compareAndSet(cur, cur + weight)) {
                     return true;
                 }
@@ -115,20 +106,19 @@ public class DualQueueGate {
         Waiter w = new Waiter(weight, Thread.currentThread());
         incoming.offer(w);
         activeCount.incrementAndGet();
-
         LockSupport.unpark(schedulerThread);
 
-        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
         while (!w.granted) {
             if (Thread.interrupted()) {
                 w.cancelled = true;
-                decrementActive(weight);
+                activeCount.decrementAndGet();
                 throw new InterruptedException();
             }
-            long remaining = deadlineNanos - System.nanoTime();
+            long remaining = deadlineNs - System.nanoTime();
             if (remaining <= 0) {
                 w.cancelled = true;
-                decrementActive(weight);
+                activeCount.decrementAndGet();
                 return false;
             }
             LockSupport.parkNanos(this, remaining);
@@ -138,15 +128,15 @@ public class DualQueueGate {
 
     public void release(int weight) {
         if (weight < 1) weight = 1;
-        int newVal = inUseWeight.addAndGet(-weight);
-        if (newVal < 0) {
+        int updated = inUseWeight.addAndGet(-weight);
+        if (updated < 0) {
             if (underflowMode == UnderflowMode.STRICT) {
                 inUseWeight.addAndGet(weight);
                 throw new IllegalStateException(
-                        "inUseWeight underflow: " + newVal + " (weight=" + weight + ")");
+                        "inUseWeight underflow: " + updated + " (weight=" + weight + ")");
             }
-            inUseWeight.compareAndSet(newVal, 0);
-            log.warn("inUseWeight underflow: {} (weight={})", newVal, weight);
+            inUseWeight.compareAndSet(updated, 0);
+            log.warn("inUseWeight underflow: {} (weight={})", updated, weight);
         }
         LockSupport.unpark(schedulerThread);
     }
@@ -175,6 +165,8 @@ public class DualQueueGate {
         running = false;
         LockSupport.unpark(schedulerThread);
     }
+
+    // --- scheduler loop -------------------------------------------------------
 
     private void schedulerLoop() {
         while (running) {
@@ -206,12 +198,15 @@ public class DualQueueGate {
             Waiter next = pickNext();
             if (next == null) break;
             if (!tryGrant(next)) {
+                // Lost the capacity to a fast-path acquire or a shrink. Put the
+                // waiter back at the head so we don't strand it and try again
+                // next cycle once permits free up.
                 if (next.cancelled) continue;
                 active.addFirst(next);
                 break;
             }
-            if (++grantCounterSinceSweep >= SWEEP_INTERVAL) {
-                grantCounterSinceSweep = 0;
+            if (++grantsSinceSweep >= SWEEP_INTERVAL) {
+                grantsSinceSweep = 0;
                 sweepBudgeted();
             }
         }
@@ -225,7 +220,8 @@ public class DualQueueGate {
         int cap = logicalCapacity.get();
         Waiter head = active.peekFirst();
 
-        long headWaitMs = (System.nanoTime() - head.enqueueTimeNanos) / 1_000_000;
+        // Aging: a head that has waited too long jumps the SJF scan.
+        long headWaitMs = (System.nanoTime() - head.enqueuedAtNs) / 1_000_000;
         if (headWaitMs >= HEAD_AGING_MS) {
             if (cur + head.weight <= cap) {
                 active.removeFirst();
@@ -234,11 +230,13 @@ public class DualQueueGate {
             return null;
         }
 
+        // Fast path: head is already the smallest possible weight.
         if (head.weight == 1 && cur + 1 <= cap) {
             active.removeFirst();
             return head;
         }
 
+        // SJF-ish scan within a bounded window.
         Iterator<Waiter> it = active.iterator();
         int scanned = 0;
         Waiter best = null;
@@ -246,11 +244,9 @@ public class DualQueueGate {
             Waiter cand = it.next();
             if (cand.cancelled) { it.remove(); continue; }
             scanned++;
-            if (cur + cand.weight <= cap) {
-                if (best == null || cand.weight < best.weight) {
-                    best = cand;
-                    if (best.weight == 1) break;
-                }
+            if (cur + cand.weight <= cap && (best == null || cand.weight < best.weight)) {
+                best = cand;
+                if (best.weight == 1) break;
             }
         }
         if (best != null) {
@@ -280,37 +276,23 @@ public class DualQueueGate {
         int cur;
         do {
             cur = inUseWeight.get();
-            int cap = logicalCapacity.get();
-            if (cur + w.weight > cap) return false;
+            if (cur + w.weight > logicalCapacity.get()) return false;
         } while (!inUseWeight.compareAndSet(cur, cur + w.weight));
 
-        decrementActive(w.weight);
+        activeCount.decrementAndGet();
         w.granted = true;
         LockSupport.unpark(w.thread);
         return true;
-    }
-
-    private void decrementActive(int weight) {
-        activeCount.decrementAndGet();
     }
 
     private boolean isEmpty() {
         return incoming.isEmpty() && active.isEmpty();
     }
 
-    public int availablePermits() {
-        return Math.max(0, logicalCapacity.get() - inUseWeight.get());
-    }
+    // --- diagnostics ----------------------------------------------------------
 
-    public int logicalCapacity() {
-        return logicalCapacity.get();
-    }
-
-    public int getQueueLength() {
-        return activeCount.get();
-    }
-
-    public int borrowedPermits() {
-        return 0;
-    }
+    public int availablePermits() { return Math.max(0, logicalCapacity.get() - inUseWeight.get()); }
+    public int logicalCapacity()  { return logicalCapacity.get(); }
+    public int getQueueLength()   { return activeCount.get(); }
+    public int borrowedPermits()  { return 0; }
 }

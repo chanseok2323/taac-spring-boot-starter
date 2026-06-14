@@ -27,7 +27,6 @@ import io.github.chanseok.taac.token.WeightStrategy;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -37,11 +36,10 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 /**
  * TAAC autoconfiguration.
  *
- * <p>Rule of thumb: every bean here is {@code @ConditionalOnMissingBean}, so
- * any of them can be swapped by registering your own {@code @Bean} of the
- * same type. The policy/gate combination is selected by the
- * {@code taac.admission.policy} property; setting it to anything Spring can
- * see is enough to switch behaviour.
+ * <p>Every bean here is {@code @ConditionalOnMissingBean} — declare your own
+ * {@code @Bean} of the same type to replace it. The active policy and gate
+ * are selected by {@code taac.admission.policy}; everything else falls into
+ * place around that choice.
  */
 @AutoConfiguration
 @ConditionalOnProperty(prefix = "taac", name = "enabled", havingValue = "true", matchIfMissing = true)
@@ -51,7 +49,7 @@ public class TaacAutoConfiguration {
 
     private static final String POLICY = "taac.admission.policy";
 
-    // ── shared infrastructure ────────────────────────────────────────────────
+    // --- shared infrastructure ------------------------------------------------
 
     @Bean @ConditionalOnMissingBean
     public TokenCounter taacTokenCounter() {
@@ -73,21 +71,21 @@ public class TaacAutoConfiguration {
         return new TokenWeightTracker(props.getToken().getDefaultAvg(), props.getToken().getMaxWeight());
     }
 
-    /** Metrics ride on the listener bus alongside any user-supplied listeners. */
+    /** Default observer — metrics. Shares the bus with any user listeners. */
     @Bean
     public AdmissionListener taacMetricsAdmissionListener(AdmissionMetrics metrics) {
         return new MetricsAdmissionListener(metrics);
     }
 
-    // ── policies (exactly one is active, picked by property) ─────────────────
+    // --- policies (exactly one is active) -------------------------------------
 
     @Bean @ConditionalOnMissingBean
     @ConditionalOnProperty(name = POLICY, havingValue = "vegas", matchIfMissing = true)
     public ConcurrencyPolicy taacTokenAwareVegasPolicy(TaacProperties props) {
         var a = props.getAdmission();
         int maxWeight = props.getToken().getMaxWeight();
-        // weight=maxWeight requests need a permit budget at least their size,
-        // otherwise heavy work never makes it past the head of the queue.
+        // Heaviest request needs a permit budget at least its own size, or
+        // it sits at the head of the queue forever.
         if (a.getMinConcurrency() < maxWeight) {
             throw new IllegalStateException(
                     "taac.admission.min-concurrency (" + a.getMinConcurrency() + ")"
@@ -95,14 +93,15 @@ public class TaacAutoConfiguration {
                             + ") for the vegas policy");
         }
         return new TokenAwareVegasPolicy(a.getMaxConcurrency(), a.getMinConcurrency(),
-                a.getThreshold().getCritical());
+                a.getThreshold().getModerate(), a.getThreshold().getHigh(), a.getThreshold().getCritical());
     }
 
     @Bean @ConditionalOnMissingBean
     @ConditionalOnProperty(name = POLICY, havingValue = "vegas-pure")
     public ConcurrencyPolicy taacPureVegasPolicy(TaacProperties props) {
         var a = props.getAdmission();
-        return new PureVegasPolicy(a.getMaxConcurrency(), a.getMinConcurrency());
+        return new PureVegasPolicy(a.getMaxConcurrency(), a.getMinConcurrency(),
+                a.getThreshold().getModerate(), a.getThreshold().getHigh(), a.getThreshold().getCritical());
     }
 
     @Bean @ConditionalOnMissingBean
@@ -125,7 +124,7 @@ public class TaacAutoConfiguration {
     public ConcurrencyPolicy taacStandardAimdPolicy(TaacProperties props) {
         var a = props.getAdmission();
         return new StandardAimdPolicy(a.getMaxConcurrency(), a.getMinConcurrency(),
-                a.getThreshold().getCritical());
+                a.getThreshold().getModerate(), a.getThreshold().getHigh(), a.getThreshold().getCritical());
     }
 
     @Bean @ConditionalOnMissingBean
@@ -134,10 +133,14 @@ public class TaacAutoConfiguration {
         return new FixedConcurrencyPolicy(props.getAdmission().getMaxConcurrency());
     }
 
-    // ── gates ────────────────────────────────────────────────────────────────
+    // --- gates ----------------------------------------------------------------
+    //
+    // Vegas registers its specialised gate; everyone else falls through to the
+    // Semaphore-backed default, which kicks in when a ConcurrencyPolicy exists
+    // but no AdmissionGate has been registered yet.
 
-    /** Token-weighted SJF gate — only the vegas policy uses it. */
-    @Bean(destroyMethod = "close") @ConditionalOnMissingBean
+    @Bean(destroyMethod = "close")
+    @ConditionalOnMissingBean
     @ConditionalOnProperty(name = POLICY, havingValue = "vegas", matchIfMissing = true)
     public AdmissionGate taacDualQueueGate(TaacProperties props) {
         var a = props.getAdmission();
@@ -145,29 +148,25 @@ public class TaacAutoConfiguration {
                 a.getUnderflowMode(), a.getSchedulerIdleParkMs(), a.isFastPathEnabled());
     }
 
-    /** Plain semaphore — used by the non-vegas, non-baseline policies. */
-    @Bean(destroyMethod = "close") @ConditionalOnMissingBean
-    @ConditionalOnExpression(
-        "'${" + POLICY + ":vegas}' == 'vegas-pure' "
-        + "|| '${" + POLICY + ":vegas}' == 'response-time' "
-        + "|| '${" + POLICY + ":vegas}' == 'standard-aimd' "
-        + "|| '${" + POLICY + ":vegas}' == 'fixed'")
+    @Bean(destroyMethod = "close")
+    @ConditionalOnMissingBean
+    @ConditionalOnBean(ConcurrencyPolicy.class)
     public AdmissionGate taacSemaphoreGate(TaacProperties props) {
         var a = props.getAdmission();
         return new SemaphoreAdmissionGate(a.getMaxConcurrency(), a.isFair());
     }
 
-    // ── controllers ──────────────────────────────────────────────────────────
+    // --- controllers ----------------------------------------------------------
 
-    /** Baseline shortcut — no policy/gate beans are created in this mode. */
-    @Bean @ConditionalOnMissingBean(AdmissionController.class)
+    @Bean
+    @ConditionalOnMissingBean(AdmissionController.class)
     @ConditionalOnProperty(name = POLICY, havingValue = "baseline")
     public AdmissionController taacNoOpAdmissionController() {
         return new NoOpAdmissionController();
     }
 
-    /** Wires whatever policy + gate are in the context (i.e. every non-baseline mode). */
-    @Bean @ConditionalOnMissingBean(AdmissionController.class)
+    @Bean
+    @ConditionalOnMissingBean(AdmissionController.class)
     @ConditionalOnBean({ConcurrencyPolicy.class, AdmissionGate.class})
     public AdmissionController taacAdmissionController(ConcurrencyPolicy policy,
                                                        AdmissionGate gate,
@@ -175,16 +174,15 @@ public class TaacAutoConfiguration {
                                                        ObjectProvider<AdmissionListener> listeners,
                                                        TaacProperties props) {
         var a = props.getAdmission();
-        AdmissionListener composite = new CompositeAdmissionListener(
-                listeners.orderedStream().toList());
-        return new PolicyDrivenAdmissionController(
-                policy, gate, memoryMonitor, composite,
+        AdmissionListener composite = new CompositeAdmissionListener(listeners.orderedStream().toList());
+        return new PolicyDrivenAdmissionController(policy, gate, memoryMonitor, composite,
                 a.getMaxConcurrency(), a.getTimeoutMs(), a.isDynamicCapacityFailFast());
     }
 
-    // ── user-facing facade ───────────────────────────────────────────────────
+    // --- user-facing facade ---------------------------------------------------
 
-    @Bean @ConditionalOnMissingBean
+    @Bean
+    @ConditionalOnMissingBean
     @ConditionalOnBean(AdmissionController.class)
     public AdmissionTemplate taacAdmissionTemplate(AdmissionController controller,
                                                    TokenCounter tokenCounter,
